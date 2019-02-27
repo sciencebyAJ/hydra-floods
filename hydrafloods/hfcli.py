@@ -3,14 +3,16 @@ import fire
 import glob
 import yaml
 import warnings
-import xarray as xr
+# import xarray as xr
 import geopandas as gpd
-import rastersmith as rs
+# import rastersmith as rs
 
 from . import fetch
 from . import utils
-from . import downscale
-from . import processing as proc
+# from . import downscale
+# from . import processing as proc
+from . import db
+
 
 class hydrafloods(object):
     def __init__(self,configuration=None):
@@ -56,6 +58,11 @@ class hydrafloods(object):
             else:
                 raise AttributeError('provided yaml file does not have a specified region in configuration')
 
+            if 'db' in confKeys:
+                self.db = conf['db']
+            else:
+                raise AttributeError('provided yaml file does not have a specified database name in configuration')
+
             if 'credentials' in ftchKeys:
                 self.credentials = ftch['credentials']
             else:
@@ -91,7 +98,7 @@ class hydrafloods(object):
 
         return
 
-    def download(self, product, date,return_list=False):
+    def ingest(self, product, date,dbname='hydradb'):
         date = utils.decode_date(date)
 
         if product in ['atms','viirs','landsat','modis']:
@@ -107,17 +114,22 @@ class hydrafloods(object):
             if product == 'landsat':
                 tileShp = gpd.read_file(os.path.join(self.filePath,'data/landsat_wrs2.geojson'))
                 downTiles = fetch.findTiles(self.region,tileShp)
-                print(downTiles)
+                bools = [False if i != 0 else True for i in range(len(downTiles))]
+                args = list(zip(*[downTiles,bools]))
 
-                files = list(map(lambda x: fetch.landsat(date,x[0],x[1],prodDir,maxClouds=50)
-                                ,downTiles)
-                            )
-                files = [f for f in files if f is not None]
+                for i,tile in enumerate(downTiles):
+                    p,r = tile
+                    files = db.landsat.fetch(date,p,r,outdir=prodDir,updateScenes=bools[i],
+                                        maxClouds=50)
+                    if files:
+                        db.landsat.ingest(files,dbname=self.db)
+
+                # files = [f for f in files if f is not None]
 
             elif product == 'viirs':
                 product = self.viirsFetch['product']
                 tileShp = gpd.read_file(os.path.join(self.filePath,'data/viirs_sinu.geojson'))
-                downTiles = fetch.findTiles(self.region,tileShp)
+                downTiles = db.viirs.findTiles(self.region,tileShp)
 
                 files = list(map(lambda x: fetch.viirs(date,x[0],x[1],prodDir,creds=self.credentials,
                                                        product=product)
@@ -136,24 +148,18 @@ class hydrafloods(object):
                             )
 
             elif product == 'atms':
-                h5files = fetch.atms(date,prodDir,creds=None)
+                h5files = db.atms.fetch(self.region,date,prodDir,creds=self.credentials)
+                print(h5files)
+                for f in h5files:
+                    tiff = db.atms.unpack(f)
+                    db.atms.ingest(tiff,dbname=self.db)
 
-                sdrFiles, geoFiles = fetch.spatialSwathFilter(self.region,h5files)
-
-                files = list(zip(*[sdrFiles,geoFiles]))
-
-                for h5 in h5files:
-                    if (h5 not in sdrFiles) and (h5 not in geoFiles):
-                        os.remove(h5)
 
             else:
                 files = None
 
         else:
             raise NotImplementedError('select product is currently not implemented, please check back with later versions')
-
-        if return_list:
-            return files
 
         return
 
@@ -172,7 +178,7 @@ class hydrafloods(object):
                 atmsGr = rs.Grid(region=self.region.bounds.values[0],resolution=grRes)
                 gr = rs.Grid(region=self.region.bounds.values[0],resolution=90)
 
-                bathtub = downscale.Bathtub(gr)
+                bathtub = downscale.Bathtub(gr,probablistic=True,elvStdDev=2.5)
 
                 files = glob.glob(os.path.join(prodDir,'*.h5'))
                 swaths = fetch.groupSwathFiles(files)
@@ -232,7 +238,7 @@ class hydrafloods(object):
                 if 'downscale' in paramKeys:
                     print(params['downscale'])
                     if params['downscale'] in [False,'False','false',0]:
-                        waterMap = proc.Viirs.getWaterMask(mndwi,transform=False)
+                        waterMap = proc.Viirs.getWaterMask(mndwi)
                         waterMap.attrs = proj[0].attrs
                         waterMap.raster.writeGeotiff(prodDir,self.conf['name'],noData=-9999)
                     else:
@@ -244,6 +250,21 @@ class hydrafloods(object):
                 params = self.landsatParams
                 paramKeys = list(params.keys())
 
+                gr = rs.Grid(region=self.region.bounds.values[0],resolution=90)
+
+                # for subdir, dirs, files in os.walk('./'):
+                #     for file in files:
+                #         do some stuff
+                #         print file
+
+                files = glob.glob(os.path.join(prodDir,'*_MTL.txt'))
+
+                for f in files:
+
+                    l = rs.Landsat.read('/Users/loaner/rs_data/landsat/LC08_L1TP_132048_20180306_20180319_01_T1_MTL.txt')
+                    lUpsamp = rs.mapping.reduceNeighborhood(l,window=3,reducer='mean',reduceResolution=True)
+                    lProj = rs.mapping.reproject(lUpsamp,outEpsg='4326',outResolution=90)
+                    lRemap = rs.mapping.coregister(lProj,to=gr)
 
 
             else:
@@ -253,6 +274,7 @@ class hydrafloods(object):
             raise NotImplementedError('select product is currently not implemented, please check back with later versions')
 
         return
+
 
 def main():
     fire.Fire(hydrafloods)

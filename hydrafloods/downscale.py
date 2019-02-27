@@ -128,8 +128,11 @@ class USTARFM(object):
         return
 
 class Bathtub(object):
-    def __init__(self,gr,probablistic=False,demStdDev=4.2,nIter=100):
+    def __init__(self,gr,probablistic=False,elvStdDev=4.2,niter=10):
         self.gr = gr
+        self.prob = probablistic
+        self.elvStdDev = elvStdDev
+        self.niter = niter
 
         return
 
@@ -182,7 +185,7 @@ class Bathtub(object):
             absDiff = np.abs(diff)
 
             maxDepth = absDiff.argmin()
-            resid = diff[maxDepth-1]
+            resid = diff[maxDepth]
 
             simWater = depth <= maxDepth
 
@@ -223,19 +226,40 @@ class Bathtub(object):
 
         args = list(zip(*[grids,fracs]))
 
-        if parallel==True:
-            ncores = mp.cpu_count() - 1
-            p = mp.Pool(ncores)
-            waterGrids = p.map(self._applyParallel,args)
+        if self.prob:
+            x = hand.values
+
+            for i in range(self.niter):
+                simElv = hand.copy()
+                y = np.random.normal(x.ravel(),self.elvStdDev,x.ravel().size)
+                simElv.values = y.reshape(x.shape)
+
+                waterGrids = list(map(lambda x: self.fillGrid(x[0],x[1]),args))
+                waterMap = self.grids2raster(fWater,hand,waterGrids,yDim,xDim)
+                waterMap = waterMap.isel(band=slice(0,1))
+                waterMap.coords['bands'] = 'water'
+
+                if i == 0:
+                    waterOut = waterMap.copy()
+                else:
+                    waterOut = waterOut + waterMap
 
         else:
-            waterGrids = list(map(lambda x: self.fillGrid(x[0],x[1]),args))
+            if parallel==True:
+                ncores = mp.cpu_count() - 1
+                p = mp.Pool(ncores)
+                waterGrids = p.map(self._applyParallel,args)
 
-        waterMap = self.grids2raster(fWater,hand,waterGrids,yDim,xDim)
-        waterMap = waterMap.isel(band=slice(0,1))
-        waterMap.coords['bands'] = 'water'
+            else:
+                waterGrids = list(map(lambda x: self.fillGrid(x[0],x[1]),args))
 
-        return waterMap
+            waterMap = self.grids2raster(fWater,hand,waterGrids,yDim,xDim)
+            waterOut = waterMap.isel(band=slice(0,1))
+            waterOut.coords['bands'] = 'water'
+
+        waterOut.attrs = hand.attrs
+
+        return waterOut
 
     def _applyParallel(self,args):
         grid,frac = args
